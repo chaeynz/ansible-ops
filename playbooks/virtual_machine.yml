@@ -1,0 +1,204 @@
+---
+- name: Manage Virtual Machine Deployment using Terraform
+  hosts: localhost
+  vars:
+    backend_config: &backend_config
+      bucket: "{{ s3_bucket_name }}"
+      key: "{{ s3_object_key }}"
+      skip_credentials_validation: "true"
+      skip_metadata_api_check: "true"
+      skip_region_validation: "true"
+      skip_requesting_account_id: "true"
+      skip_s3_checksum: "true"
+      use_path_style: "true"
+    _state: present
+
+  tasks:
+    - name: Set state # WTF IS THIS ???
+      delegate_to: all
+      ansible.builtin.set_fact:
+        _state: "{{ _state | default('present') }}"
+
+    - name: Git | Retrieve repository for Terraform code
+      ansible.scm.git_retrieve:
+        origin:
+          url: "{{ tf_repo }}"
+      register: tf_repo_location
+
+    - debug: var=tf_repo_location
+
+    - name: vCenter | Ensure folder in vCenter exists
+      when: _state == 'present'
+      vmware.vmware.folder:
+        absolute_path: "/{{ datacenter }}/vm/{{ vm_folder }}"
+
+    - name: vCenter via Terraform | Ensure state of virtual machine (Provisioning network)
+      cloud.terraform.terraform:
+        project_path: "{{ tf_repo_location.path }}"
+        state: "{{ _state }}"
+        force_init: true
+        complex_vars: true
+        variables:
+          virtual_machines:
+            vm1:
+              name: "{{ vm_name }}"
+              datacenter: "{{ datacenter }}"
+              datastore: "{{ datastore }}"
+              cluster: "{{ cluster }}"
+              network: "{{ provisioning_network }}"
+              folder: "{{ vm_folder }}"
+              memory: 8 # UHM THIS DID NOT WORK FOR SOME REASON
+              num_cpus: 8
+              disk_size: 40
+              template: "{{ vm_template_path }}"
+        backend_config:
+          <<: *backend_config
+      environment:
+        VSPHERE_SERVER: "{{ lookup('ansible.builtin.env', 'VMWARE_HOST', default=omit) }}"
+        VSPHERE_USER: "{{ lookup('ansible.builtin.env', 'VMWARE_USER', default=omit) }}"
+        VSPHERE_PASSWORD: "{{ lookup('ansible.builtin.env', 'VMWARE_PASSWORD', default=omit) }}"
+        VSPHERE_ALLOW_UNVERIFIED_SSL: "true"
+      register: v
+
+    - name: Absent 1 | End the play here
+      when: _state == 'absent'
+      ansible.builtin.meta: end_play
+
+    # restart VM in case that the VM already existed previously
+
+    - name: Get VMs from Terraform result
+      ansible.builtin.set_fact:
+        vms: "{{
+          (
+            (v.diff.after['values'].root_module.child_modules | first).resources | selectattr('type', 'eq', 'vsphere_virtual_machine')
+          ) | rejectattr('name', 'eq', 'template')
+            | community.general.json_query('[].values.{ip_address: default_ip_address, vm_name: name}')
+          }}"
+
+    - name: Add hosts to inventory
+      loop: "{{ vms }}"
+      ansible.builtin.add_host:
+        name: "{{ item.vm_name }}"
+        groups:
+          - new_vms
+        ansible_host: "{{ item.ip_address }}"
+        ansible_user: ansible
+        _state: "{{ _state }}"
+
+- name: Linux | Configure new VMs
+  hosts: new_vms
+  tasks:
+    - name: Absent 2 | End the play here
+      when: _state == 'absent'
+      ansible.builtin.meta: end_play
+
+    - name: Linux | Dump a fat load in the terminal # Why ??
+      debug:
+        msg: "{{ hostvars }}"
+
+    - name: Linux | Remove build key
+      become: true
+      ansible.posix.authorized_key:
+        user: "{{ username }}"
+        key: "{{ build_key }}"
+        state: absent
+
+    - name: Linux | Add ansible users public key to build user temporarily
+      become: true
+      ansible.posix.authorized_key:
+        user: "{{ username }}"
+        key: "{{ pubkey_ansible }}"
+        state: present
+
+    - name: Linux | Set default password on build user
+      become: true
+      ansible.builtin.user:
+        name: "{{ username }}"
+        password: '{{ default_password }}'
+
+    - name: Linux | Disallow SSH password authentication
+      become: true
+      ansible.builtin.lineinfile:
+        dest: /etc/ssh/sshd_config
+        regexp: "^PasswordAuthentication"
+        line: "PasswordAuthentication no"
+        state: present
+        validate: sshd -t -f %s
+
+    - name: Switch ansible_user to build user
+      ansible.builtin.set_fact:
+        ansible_user: "{{ username }}"
+
+    - name: Linux | Prepare SSH for login on build user
+      become: true
+      ansible.posix.authorized_key:
+        user: "{{ username }}"
+        key: "{{ public_key }}"
+        state: present
+        exclusive: true
+
+    # Should I just KILL the processes ? ? ?
+    - name: Linux | Wait until no processes are owned by ansible user
+      ansible.builtin.shell: |
+        pgrep -u ansible || true
+      register: ansible_user_processes
+      retries: 30
+      delay: 5
+      until: ansible_user_processes.stdout == ""
+
+    - name: Linux | Remove ansible user
+      become: true
+      ansible.builtin.user:
+        name: ansible
+        state: absent
+        remove: true
+
+    - name: Linux | Remove ansible users public key from build user
+      become: true
+      ansible.posix.authorized_key:
+        user: "{{ username }}"
+        key: "{{ public_key }}"
+        state: present
+        exclusive: true
+
+- name: vCenter | Migrate to target network
+  hosts: localhost
+  tasks:
+    - name: Absent 3 | End the play here
+      when: _state == 'absent'
+      ansible.builtin.meta: end_play
+
+    - name: vCenter via Terraform | Ensure state of virtual machine (Migrate to target network)
+      cloud.terraform.terraform:
+        project_path: "{{ tf_repo_location.path }}"
+        state: "{{ _state }}"
+        force_init: true
+        complex_vars: true
+        variables:
+          virtual_machines:
+            vm1:
+              name: "{{ vm_name }}"
+              datacenter: "{{ datacenter }}"
+              datastore: "{{ datastore }}"
+              cluster: "{{ cluster }}"
+              network: "{{ network }}"
+              folder: "{{ vm_folder }}"
+              memory: 8
+              num_cpus: 8
+              disk_size: 40
+              template: "{{ template }}"
+        backend_config:
+          <<: *backend_config
+      environment:
+        VSPHERE_SERVER: "{{ lookup('ansible.builtin.env', 'VMWARE_HOST', default=omit) }}"
+        VSPHERE_USER: "{{ lookup('ansible.builtin.env', 'VMWARE_USER', default=omit) }}"
+        VSPHERE_PASSWORD: "{{ lookup('ansible.builtin.env', 'VMWARE_PASSWORD', default=omit) }}"
+        VSPHERE_ALLOW_UNVERIFIED_SSL: "true"
+      register: v
+
+    - name: vCenter | Reboot the VM
+      vmware.vmware.vm_powerstate:
+        datacenter: "{{ datacenter }}"
+        folder: "{{ datacenter }}/vm/{{ vm_folder }}"
+        name: "{{ vm_name }}"
+        state: reboot-guest

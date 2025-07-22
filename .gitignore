@@ -1,0 +1,23 @@
+
+# CONSISTENCY 🚬
+*.yaml
+
+# IDE stuff qwq
+.vscode/
+.VSCodeCounter/
+
+# :3
+/*inventory.yml
+/*inventory.ini
+
+# No env files allowed here! uwu
+*.env
+env
+
+venv/
+artifacts
+
+# Cache <.<
+__pycache__/
+.ansible/
+collections/ansible_collections
