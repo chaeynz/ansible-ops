@@ -12,6 +12,7 @@
       skip_s3_checksum: "true"
       use_path_style: "true"
     _state: present
+    _hosts: "vms" # gay !
 
   tasks:
     - name: Set state # WTF IS THIS ???
@@ -29,8 +30,10 @@
 
     - name: vCenter | Ensure folder in vCenter exists
       when: _state == 'present'
+      loop: "{{ groups[_hosts] }}"
       vmware.vmware.folder:
-        absolute_path: "/{{ datacenter }}/vm/{{ vm_folder }}"
+        absolute_path: "/{{ hostvars[item].datacenter }}/vm/{{ hostvars[item].vm_folder }}"
+        state: present
 
     - name: vCenter via Terraform | Ensure state of virtual machine (Provisioning network)
       cloud.terraform.terraform:
@@ -38,19 +41,26 @@
         state: "{{ _state }}"
         force_init: true
         complex_vars: true
-        variables:
-          virtual_machines:
-            vm1:
-              name: "{{ vm_name }}"
-              datacenter: "{{ datacenter }}"
-              datastore: "{{ datastore }}"
-              cluster: "{{ cluster }}"
-              network: "{{ provisioning_network }}"
-              folder: "{{ vm_folder }}"
-              memory: 8 # UHM THIS DID NOT WORK FOR SOME REASON
-              num_cpus: 8
-              disk_size: 40
-              template: "{{ vm_template_path }}"
+        variables: >-
+          {%- set result = {"virtual_machines": {}} -%}
+          {%- for host in groups[_hosts] -%}
+            {%- set _ = result["virtual_machines"].update({
+              hostvars[host].vm_name: {
+                "name": hostvars[host].vm_name,
+                "datacenter": hostvars[host].datacenter,
+                "datastore": hostvars[host].datastore,
+                "cluster": hostvars[host].cluster,
+                "network": hostvars[host].provisioning_network,
+                "folder": hostvars[host].vm_folder,
+                "memory": "8",
+                "num_cpus": "8",
+                "disk_size": "40",
+                "template": hostvars[host].vm_template_path
+              }
+            })
+            -%}
+          {%- endfor -%}
+          {{ result }}
         backend_config:
           <<: *backend_config
       environment:
@@ -96,25 +106,19 @@
       debug:
         msg: "{{ hostvars }}"
 
-    - name: Linux | Remove build key
-      become: true
-      ansible.posix.authorized_key:
-        user: "{{ username }}"
-        key: "{{ build_key }}"
-        state: absent
-
     - name: Linux | Add ansible users public key to build user temporarily
       become: true
       ansible.posix.authorized_key:
         user: "{{ username }}"
         key: "{{ pubkey_ansible }}"
         state: present
+        exclusive: true
 
     - name: Linux | Set default password on build user
       become: true
       ansible.builtin.user:
         name: "{{ username }}"
-        password: '{{ default_password }}'
+        password: "{{ default_password }}"
 
     - name: Linux | Disallow SSH password authentication
       become: true
@@ -163,6 +167,8 @@
 
 - name: vCenter | Migrate to target network
   hosts: localhost
+  vars:
+    _hosts: vms
   tasks:
     - name: Absent 3 | End the play here
       when: _state == 'absent'
@@ -174,19 +180,27 @@
         state: "{{ _state }}"
         force_init: true
         complex_vars: true
-        variables:
-          virtual_machines:
-            vm1:
-              name: "{{ vm_name }}"
-              datacenter: "{{ datacenter }}"
-              datastore: "{{ datastore }}"
-              cluster: "{{ cluster }}"
-              network: "{{ network }}"
-              folder: "{{ vm_folder }}"
-              memory: 8
-              num_cpus: 8
-              disk_size: 40
-              template: "{{ template }}"
+        variables: >-
+          {%- set result = {"virtual_machines": {}} -%}
+          {%- for host in groups[_hosts] -%}
+            {%- set _ = result["virtual_machines"].update({
+              hostvars[host].vm_name: {
+                "name": hostvars[host].vm_name,
+                "datacenter": hostvars[host].datacenter,
+                "datastore": hostvars[host].datastore,
+                "cluster": hostvars[host].cluster,
+                "network": hostvars[host].network,
+                "folder": hostvars[host].vm_folder,
+                "memory": "8",
+                "num_cpus": "8",
+                "disk_size": "40",
+                "template": hostvars[host].vm_template_path
+              }
+            })
+            -%}
+          {%- endfor -%}
+          {{ result }}
+
         backend_config:
           <<: *backend_config
       environment:
@@ -197,8 +211,9 @@
       register: v
 
     - name: vCenter | Reboot the VM
+      loop: "{{ groups['new_vms'] }}"
       vmware.vmware.vm_powerstate:
-        datacenter: "{{ datacenter }}"
-        folder: "{{ datacenter }}/vm/{{ vm_folder }}"
-        name: "{{ vm_name }}"
+        datacenter: "{{ hostvars[item].datacenter }}"
+        folder: "{{ hostvars[item].datacenter }}/vm/{{ hostvars[item].vm_folder }}"
+        name: "{{ hostvars[item].vm_name }}"
         state: reboot-guest
